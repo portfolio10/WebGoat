@@ -1,85 +1,108 @@
 pipeline {
-    agent any
+    agent { label 'master' }
 
     environment {
-        AWS_REGION  = 'ap-northeast-2'
-        ACCOUNT_ID  = '805369546017'
-        IMAGE_NAME  = 'jenkins-demo'
-        ECR_URL     = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webgoat-ecr"
-        S3_BUCKET   = 'jenkins-webgoat-bucket'
-        BUNDLE      = 'webgoat-deploy-bundle.zip'
-        DEPLOY_APP  = 'webgoat-cd-app'
-        DEPLOY_GROUP = 'webgoat-deployment-group'
-    }
-
-    tools {
-        jdk 'jdk-23'
+        JAVA_HOME   = "/usr/lib/jvm/java-17-amazon-corretto.x86_64"
+        PATH        = "${env.JAVA_HOME}/bin:${env.PATH}"
+        SSH_CRED_ID = "WH1_key"
+        DYNAMIC_IMAGE_TAG = "dev-${env.BUILD_NUMBER}-${sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()}"
     }
 
     stages {
-        stage('DEBUG JAVA') {
+        stage('📦 Checkout') {
             steps {
-                sh '''
-                  echo "JAVA_HOME=$JAVA_HOME"
-                  java -version
-                  mvn -version
-                '''
+                checkout scm
+            }
+        }
+        /*
+        stage('🧪 SonarQube Analysis') {
+            steps {
+                script {
+                    load 'components/scripts/sonarqube_analysis.groovy'
+                }
+            }
+        }
+*/
+        stage('🔨 Build JAR') {
+            steps {
+                sh 'components/scripts/Build_JAR.sh'
+            }
+        }
+        
+        // stage('🚀 SCA 병렬 실행') {
+        //     agent { label 'SCA' }
+        //     steps {
+        //         script {
+        //             def sca = load 'components/scripts/sca_parallel.groovy'
+        //             sca.runScaJobs()
+        //         }
+        //     }
+        // }
+
+
+        stage('🐳 Docker Build') {
+            steps {
+                sh 'DYNAMIC_IMAGE_TAG=${DYNAMIC_IMAGE_TAG} components/scripts/Docker_Build.sh'
             }
         }
 
-        stage('Build JAR') {
+        stage('🔐 ECR Login') {
             steps {
-                sh 'mvn clean package -DskipTests'
+                sh 'components/scripts/ECR_Login.sh'
             }
         }
 
-        stage('Docker Build') {
+        stage('🚀 Push to ECR') {
             steps {
-                sh 'docker build -t $IMAGE_NAME .'
+                sh 'DYNAMIC_IMAGE_TAG=${DYNAMIC_IMAGE_TAG} components/scripts/Push_to_ECR.sh'
             }
         }
 
-        stage('ECR Login') {
+     /*   stage('🔍 ZAP 스캔 및 SecurityHub 전송') {
+            agent { label 'DAST' }
             steps {
-                withCredentials([
-                    [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access-key-id']
-                ]) {
-                    sh '''
-                        aws ecr get-login-password --region $AWS_REGION | \
-                        docker login --username AWS --password-stdin $ECR_URL
-                    '''
+                // sh 'components/scripts/DAST_Zap_Scan.sh'
+                sh 'nohup components/scripts/DAST_Zap_Scan.sh > zap_bg.log 2>&1 &'
+            }
+        }
+*/
+        stage('🧩 Generate taskdef.json') {
+            steps {
+                script {
+                    def runTaskDefGen = load 'components/functions/generateTaskDef.groovy'
+                    runTaskDefGen(env)
                 }
             }
         }
 
-        stage('Push to ECR') {
+        stage('📄 Generate appspec.yaml') {
             steps {
-                sh '''
-                    docker tag $IMAGE_NAME:latest $ECR_URL:latest
-                    docker push $ECR_URL:latest
-                '''
+                script {
+                    def runAppSpecGen = load 'components/functions/generateAppspecAndWrite.groovy'
+                    runAppSpecGen(env.REGION)
+                }
             }
         }
 
-        stage('Upload to S3') {
+        stage('📦 Bundle for CodeDeploy') {
             steps {
-                sh '''
-                    zip -r $BUNDLE appspec.yml imagedefinitions.json
-                    aws s3 cp $BUNDLE s3://$S3_BUCKET/
-                '''
+                sh 'components/scripts/Bundle_for_CodeDeploy.sh'
             }
         }
 
-        stage('Deploy to ECS (CodeDeploy)') {
+        stage('🚀 Deploy via CodeDeploy') {
             steps {
-                sh '''
-                    aws deploy create-deployment \
-                      --application-name $DEPLOY_APP \
-                      --deployment-group-name $DEPLOY_GROUP \
-                      --s3-location bucket=$S3_BUCKET,bundleType=zip,key=$BUNDLE \
-                      --region $AWS_REGION
-                '''
+                sh 'components/scripts/Deploy_via_CodeDeploy.sh'
             }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Successfully built, pushed, and deployed!"
+        }
+        failure {
+            echo "❌ Build or deployment failed. Check logs!"
         }
     }
 }
